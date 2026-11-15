@@ -313,6 +313,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "taskbar-settings"
+version = "0.1.0"
+dependencies = [
+ "core",
+ "fontdue",
+ "tiny-skia",
+ "toml",
+ "windows",
+]
+
+[[package]]
 name = "taskbar-updater"
 version = "0.1.0"
 dependencies = [

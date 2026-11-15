@@ -1,0 +1,25 @@
+[package]
+name = "taskbar-settings"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "taskbar-settings"
+path = "src/main.rs"
+
+[dependencies]
+core = { path = "../core" }
+fontdue = "0.9"
+tiny-skia = "0.11"
+toml = "0.8"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+] }
