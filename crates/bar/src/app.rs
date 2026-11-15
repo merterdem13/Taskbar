@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
@@ -40,12 +41,41 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONUP, WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
-use core::{BarConfig, Config};
+use core::{build_modules, Clock, Config, Module, PowerSource, PowerState};
 
 use crate::appbar::{place_appbar, register_appbar, remove_appbar, WINDOW_CLASS, WM_APPBAR};
+use crate::config_watch::{
+    default_config_path, reload_keeping_previous, watch, WM_CONFIG_CHANGED,
+};
 
 const MENU_CHECK_UPDATES: usize = 1;
 const MENU_EXIT: usize = 2;
+
+struct WinClock;
+
+impl Clock for WinClock {
+    fn now(&self) -> (u8, u8) {
+        let t = unsafe { GetLocalTime() };
+        (t.wHour as u8, t.wMinute as u8)
+    }
+}
+
+struct WinPower;
+
+impl PowerSource for WinPower {
+    fn read(&self) -> Option<PowerState> {
+        let mut sps = SYSTEM_POWER_STATUS::default();
+        let ok = unsafe { GetSystemPowerStatus(&mut sps) }.is_ok() && sps.BatteryLifePercent <= 100;
+        if ok {
+            Some(PowerState {
+                percent: sps.BatteryLifePercent,
+                on_ac: sps.ACLineStatus == 1,
+            })
+        } else {
+            None
+        }
+    }
+}
 
 struct Gfx {
     target: ID2D1HwndRenderTarget,
@@ -56,21 +86,29 @@ struct Gfx {
 
 thread_local! {
     static GFX: RefCell<Option<Gfx>> = const { RefCell::new(None) };
-    static BAR_CFG: RefCell<BarConfig> = RefCell::new(BarConfig::default());
+    static CFG: RefCell<Config> = RefCell::new(Config::default());
+    static CFG_PATH: RefCell<PathBuf> = RefCell::new(PathBuf::new());
+    static MODULES: RefCell<Vec<Box<dyn Module>>> = const { RefCell::new(Vec::new()) };
     static IN_PLACE_APPBAR: Cell<bool> = const { Cell::new(false) };
 }
 
+fn rebuild_modules(cfg: &Config) {
+    let built = build_modules(&cfg.modules, Box::new(WinClock), Box::new(WinPower));
+    MODULES.with(|m| *m.borrow_mut() = built);
+}
+
 fn status_text() -> String {
-    let mut sps = SYSTEM_POWER_STATUS::default();
-    let ok = unsafe { GetSystemPowerStatus(&mut sps) }.is_ok() && sps.BatteryLifePercent <= 100;
-    let bat = if ok {
-        let ac = if sps.ACLineStatus == 1 { " \u{26A1}" } else { "" };
-        format!("\u{1F50B} {}%{}", sps.BatteryLifePercent, ac)
-    } else {
-        "\u{1F50C} AC".to_string()
-    };
-    let t = unsafe { GetLocalTime() };
-    format!("{}    {:02}:{:02}", bat, t.wHour, t.wMinute)
+    let edge = CFG.with(|c| c.borrow().bar.edge);
+    MODULES.with(|m| {
+        let mut mods = m.borrow_mut();
+        for module in mods.iter_mut() {
+            module.refresh();
+        }
+        mods.iter()
+            .map(|module| module.text(edge))
+            .collect::<Vec<_>>()
+            .join("    ")
+    })
 }
 
 fn create_gfx(hwnd: HWND) -> Result<Gfx> {
@@ -179,8 +217,8 @@ fn guarded_place_appbar(hwnd: HWND) {
     if IN_PLACE_APPBAR.replace(true) {
         return;
     }
-    let cfg = BAR_CFG.with(|c| c.borrow().clone());
-    place_appbar(hwnd, &cfg);
+    let bar_cfg = CFG.with(|c| c.borrow().bar.clone());
+    place_appbar(hwnd, &bar_cfg);
     IN_PLACE_APPBAR.set(false);
 }
 
@@ -200,7 +238,12 @@ fn show_context_menu(hwnd: HWND) {
         let Ok(menu) = CreatePopupMenu() else {
             return;
         };
-        let _ = AppendMenuW(menu, MF_STRING, MENU_CHECK_UPDATES, w!("Güncellemeleri Denetle"));
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_CHECK_UPDATES,
+            w!("Güncellemeleri Denetle"),
+        );
         let _ = AppendMenuW(menu, MF_STRING, MENU_EXIT, w!("Çıkış"));
 
         let mut pt = POINT::default();
@@ -294,6 +337,18 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
                 LRESULT(0)
             }
+            WM_CONFIG_CHANGED => {
+                let path = CFG_PATH.with(|p| p.borrow().clone());
+                let next_cfg = CFG.with(|c| {
+                    let prev = c.borrow();
+                    reload_keeping_previous(&path, &prev)
+                });
+                rebuild_modules(&next_cfg);
+                CFG.with(|c| *c.borrow_mut() = next_cfg);
+                guarded_place_appbar(hwnd);
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0)
+            }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
             WM_CLOSE => {
                 let _ = DestroyWindow(hwnd);
@@ -311,8 +366,14 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 }
 
 pub fn run(cfg: Config) -> Result<()> {
+    run_with_path(cfg, default_config_path())
+}
+
+pub fn run_with_path(cfg: Config, config_path: PathBuf) -> Result<()> {
     let cfg = cfg.clamped();
-    BAR_CFG.with(|c| *c.borrow_mut() = cfg.bar.clone());
+    rebuild_modules(&cfg);
+    CFG.with(|c| *c.borrow_mut() = cfg);
+    CFG_PATH.with(|p| *p.borrow_mut() = config_path.clone());
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -339,6 +400,7 @@ pub fn run(cfg: Config) -> Result<()> {
             Some(hi.into()),
             None,
         )?;
+        let _watch_handle = watch(&config_path, hwnd).ok();
         register_appbar(hwnd);
         guarded_place_appbar(hwnd);
         let gfx = create_gfx(hwnd)?;
