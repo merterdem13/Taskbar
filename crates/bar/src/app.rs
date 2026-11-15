@@ -2,33 +2,10 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
-};
-use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_ROUNDED_RECT,
-};
-use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_CENTER,
-};
-use windows::Win32::Graphics::Dwm::{
-    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
-    DWMWA_USE_IMMERSIVE_DARK_MODE,
-};
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
-use windows::Win32::System::SystemInformation::GetLocalTime;
-use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{
-    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Shell::ABN_POSCHANGED;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -38,54 +15,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, IDC_ARROW, MA_NOACTIVATE, MF_STRING, MSG, SW_SHOWNOACTIVATE, TPM_NONOTIFY,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE,
     WM_DPICHANGED, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NULL, WM_PAINT, WM_POWERBROADCAST,
-    WM_RBUTTONUP, WM_SIZE, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_RBUTTONUP, WM_SIZE, WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 
-use core::{build_modules, Clock, Config, Module, PowerSource, PowerState};
+use core::{build_modules, Config, Module, Size};
 
 use crate::appbar::{place_appbar, register_appbar, remove_appbar, WINDOW_CLASS, WM_APPBAR};
 use crate::config_watch::{
     default_config_path, reload_keeping_previous, watch, WM_CONFIG_CHANGED,
 };
+use crate::render::{apply_backdrop, paint_bar, D2dCanvas};
+use crate::sys::{ms_until_next_minute, SystemClock, SystemPower};
 
 const MENU_CHECK_UPDATES: usize = 1;
 const MENU_EXIT: usize = 2;
 
-struct WinClock;
-
-impl Clock for WinClock {
-    fn now(&self) -> (u8, u8) {
-        let t = unsafe { GetLocalTime() };
-        (t.wHour as u8, t.wMinute as u8)
-    }
-}
-
-struct WinPower;
-
-impl PowerSource for WinPower {
-    fn read(&self) -> Option<PowerState> {
-        let mut sps = SYSTEM_POWER_STATUS::default();
-        let ok = unsafe { GetSystemPowerStatus(&mut sps) }.is_ok() && sps.BatteryLifePercent <= 100;
-        if ok {
-            Some(PowerState {
-                percent: sps.BatteryLifePercent,
-                on_ac: sps.ACLineStatus == 1,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-struct Gfx {
-    target: ID2D1HwndRenderTarget,
-    text: IDWriteTextFormat,
-    brush: ID2D1SolidColorBrush,
-    pill: ID2D1SolidColorBrush,
-}
-
 thread_local! {
-    static GFX: RefCell<Option<Gfx>> = const { RefCell::new(None) };
+    static CANVAS: RefCell<Option<D2dCanvas>> = const { RefCell::new(None) };
     static CFG: RefCell<Config> = RefCell::new(Config::default());
     static CFG_PATH: RefCell<PathBuf> = RefCell::new(PathBuf::new());
     static MODULES: RefCell<Vec<Box<dyn Module>>> = const { RefCell::new(Vec::new()) };
@@ -93,122 +40,49 @@ thread_local! {
 }
 
 fn rebuild_modules(cfg: &Config) {
-    let built = build_modules(&cfg.modules, Box::new(WinClock), Box::new(WinPower));
+    let built = build_modules(&cfg.modules, Box::new(SystemClock), Box::new(SystemPower));
     MODULES.with(|m| *m.borrow_mut() = built);
 }
 
-fn status_text() -> String {
-    let edge = CFG.with(|c| c.borrow().bar.edge);
+fn refresh_modules() -> bool {
     MODULES.with(|m| {
         let mut mods = m.borrow_mut();
+        let mut changed = false;
         for module in mods.iter_mut() {
-            module.refresh();
+            if module.refresh() {
+                changed = true;
+            }
         }
-        mods.iter()
-            .map(|module| module.text(edge))
-            .collect::<Vec<_>>()
-            .join("    ")
+        changed
     })
 }
 
-fn create_gfx(hwnd: HWND) -> Result<Gfx> {
+fn rearm_minute_timer(hwnd: HWND) {
     unsafe {
-        let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-        let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-        let mut rc = RECT::default();
-        GetClientRect(hwnd, &mut rc)?;
-        let dpi = GetDpiForWindow(hwnd) as f32;
-        let props = D2D1_RENDER_TARGET_PROPERTIES {
-            pixelFormat: D2D1_PIXEL_FORMAT {
-                format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            dpiX: dpi,
-            dpiY: dpi,
-            ..Default::default()
-        };
-        let hprops = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-            hwnd,
-            pixelSize: D2D_SIZE_U {
-                width: (rc.right - rc.left).max(1) as u32,
-                height: (rc.bottom - rc.top).max(1) as u32,
-            },
-            presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-        };
-        let target = factory.CreateHwndRenderTarget(&props, &hprops)?;
-        let text = dwrite.CreateTextFormat(
-            w!("Segoe UI Variable Text"),
-            None,
-            DWRITE_FONT_WEIGHT_SEMI_BOLD,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            14.0,
-            w!("en-us"),
-        )?;
-        text.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
-        text.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-        let white = D2D1_COLOR_F {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 1.0,
-        };
-        let pillc = D2D1_COLOR_F {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 0.10,
-        };
-        let brush = target.CreateSolidColorBrush(&white, None)?;
-        let pill = target.CreateSolidColorBrush(&pillc, None)?;
-        Ok(Gfx {
-            target,
-            text,
-            brush,
-            pill,
-        })
+        SetTimer(Some(hwnd), 1, ms_until_next_minute(), None);
     }
 }
 
 fn paint(hwnd: HWND) {
     unsafe {
         let _ = ValidateRect(Some(hwnd), None);
-        GFX.with(|g| {
-            let g = g.borrow();
-            let Some(g) = g.as_ref() else { return };
-            let s: Vec<u16> = status_text().encode_utf16().collect();
-            let size = g.target.GetSize();
-            g.target.BeginDraw();
-            g.target.Clear(Some(&D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }));
-            let w = 240.0f32.min(size.width);
-            let r = D2D_RECT_F {
-                left: (size.width - w) / 2.0,
-                top: 6.0,
-                right: (size.width + w) / 2.0,
-                bottom: (size.height - 6.0).max(6.0),
-            };
-            g.target.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT {
-                    rect: r,
-                    radiusX: 12.0,
-                    radiusY: 12.0,
-                },
-                &g.pill,
-            );
-            g.target.DrawText(
-                &s,
-                &g.text,
-                &r,
-                &g.brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-            let _ = g.target.EndDraw(None, None);
+        let mut rc = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rc);
+        let bar_size = Size {
+            w: (rc.right - rc.left).max(1),
+            h: (rc.bottom - rc.top).max(1),
+        };
+
+        CANVAS.with(|c| {
+            let mut c = c.borrow_mut();
+            let Some(canvas) = c.as_mut() else { return };
+            let cfg = CFG.with(|cfg| cfg.borrow().clone());
+            MODULES.with(|m| {
+                let modules = m.borrow();
+                canvas.begin_draw();
+                paint_bar(canvas, bar_size, &cfg, &modules);
+                let _ = canvas.end_draw();
+            });
         });
     }
 }
@@ -275,39 +149,21 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     unsafe {
         match msg {
             WM_CREATE => {
-                let backdrop: i32 = 3; // transient window = acrylic; 2 = Mica
-                let dark: i32 = 1;
-                let _ = DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_SYSTEMBACKDROP_TYPE,
-                    &backdrop as *const _ as _,
-                    4,
-                );
-                let _ = DwmSetWindowAttribute(
-                    hwnd,
-                    DWMWA_USE_IMMERSIVE_DARK_MODE,
-                    &dark as *const _ as _,
-                    4,
-                );
-                let m = MARGINS {
-                    cxLeftWidth: -1,
-                    cxRightWidth: -1,
-                    cyTopHeight: -1,
-                    cyBottomHeight: -1,
-                };
-                let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
-                SetTimer(Some(hwnd), 1, 60_000, None);
+                let backdrop = CFG.with(|c| c.borrow().bar.backdrop);
+                apply_backdrop(hwnd, backdrop);
+                rearm_minute_timer(hwnd);
                 LRESULT(0)
             }
             WM_SIZE => {
-                GFX.with(|g| {
-                    if let Some(g) = g.borrow().as_ref() {
-                        let _ = g.target.Resize(&D2D_SIZE_U {
-                            width: ((lp.0 & 0xffff) as u32).max(1),
-                            height: (((lp.0 >> 16) & 0xffff) as u32).max(1),
-                        });
+                CANVAS.with(|c| {
+                    if let Some(canvas) = c.borrow_mut().as_mut() {
+                        canvas.resize(
+                            ((lp.0 & 0xffff) as u32).max(1),
+                            (((lp.0 >> 16) & 0xffff) as u32).max(1),
+                        );
                     }
                 });
+                let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
             WM_PAINT => {
@@ -316,11 +172,23 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_ERASEBKGND => LRESULT(1),
             WM_TIMER => {
+                rearm_minute_timer(hwnd);
+                if refresh_modules() {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_TIMECHANGE => {
+                rearm_minute_timer(hwnd);
+                let _ = refresh_modules();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
             WM_POWERBROADCAST => {
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                rearm_minute_timer(hwnd);
+                if refresh_modules() {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
                 LRESULT(1)
             }
             WM_RBUTTONUP => {
@@ -344,6 +212,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     reload_keeping_previous(&path, &prev)
                 });
                 rebuild_modules(&next_cfg);
+                apply_backdrop(hwnd, next_cfg.bar.backdrop);
                 CFG.with(|c| *c.borrow_mut() = next_cfg);
                 guarded_place_appbar(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -355,7 +224,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 LRESULT(0)
             }
             WM_DESTROY => {
-                GFX.with(|g| *g.borrow_mut() = None);
+                CANVAS.with(|c| *c.borrow_mut() = None);
                 remove_appbar(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)
@@ -403,9 +272,10 @@ pub fn run_with_path(cfg: Config, config_path: PathBuf) -> Result<()> {
         let _watch_handle = watch(&config_path, hwnd).ok();
         register_appbar(hwnd);
         guarded_place_appbar(hwnd);
-        let gfx = create_gfx(hwnd)?;
-        GFX.with(|g| *g.borrow_mut() = Some(gfx));
+        let canvas = D2dCanvas::new(hwnd)?;
+        CANVAS.with(|c| *c.borrow_mut() = Some(canvas));
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = InvalidateRect(Some(hwnd), None, false);
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);

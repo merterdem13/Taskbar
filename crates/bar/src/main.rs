@@ -3,6 +3,8 @@
 pub mod app;
 pub mod appbar;
 pub mod config_watch;
+pub mod render;
+pub mod sys;
 
 use windows::core::Result;
 
