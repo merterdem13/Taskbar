@@ -43,22 +43,23 @@ Render yığını bir **render soyutlaması** arkasında tutulur. **Kullanıcı 
    crates/core      # config şeması + sürüm göçü (migration), tema, yerleşim, modül trait'i, sürüm/manifest karşılaştırma (platformdan bağımsız, test edilebilir)
    crates/bar       # taskbar.exe: Win32 appbar, çizim, modüller, sağ-tık menüsü (Ayarlar / Güncellemeleri Denetle / Çıkış), temiz kapanış sinyali
    crates/updater   # taskbar-updater.exe (veya settings alt komutu): GitHub Releases denetleyicisi, indirici, bar'ı temiz kapatıp ikilileri değiştirip yeniden başlatıcı
-   crates/settings  # (sonra) Tauri uygulaması
+   crates/settings  # taskbar-settings.exe: ayrı süreç, windows-rs + DWM Mica + tiny-skia + fontdue ayarlar uygulaması
    ```
 3. **Yapılandırma ve Güncellemelerde Veri Korunumu:**
    - Kullanıcı ayarları kurulum dizininde değil, **`%APPDATA%\Taskbar\config.toml`** altında tutulur.
    - Güncelleyici yalnızca uygulama ikililerini (`taskbar.exe`, `taskbar-settings.exe`, `taskbar-updater.exe`) değiştirir; `%APPDATA%\Taskbar\config.toml` dosyasına **asla** dokunmaz veya üzerine varsayılan dosya yazmaz.
-   - Şema sürümlüdür (`version = 1`). Her alan `#[serde(default)]` kullanır ve `Config::migrate(raw_toml)` fonksiyonu eski sürüm dosyaları yeni sürüme taşırken kullanıcının özelleştirdiği alanları (ör. `edge = "right"`, özel renkler, kalınlık, modül sırası) birebir korur, yalnızca yeni eklenen alanlara varsayılan değer atar.
+   - Şema sürümlüdür (`version = 1`). Her alan `#[serde(default)]` kullanır ve `Config::migrate(raw_toml)` / `Config::parse` fonksiyonu eski sürüm dosyaları yeni sürüme taşırken kullanıcının özelleştirdiği alanları (ör. `edge = "right"`, özel renkler, kalınlık, modül sırası) birebir korur, yalnızca yeni eklenen alanlara varsayılan değer atar.
+   - **Widget ayar yuvaları (`[module_config.<id>]`):** Her widget (`WidgetSettings`: `show_icon`, `show_label` ve esnek `params: BTreeMap<String, String>`) `config.toml` içinde kendi yuva tablosuna sahiptir; böylece saat formatı (`24h`/`12h`), pil şarj simgesi vb. widget bazlı yapılandırmalar eklenir.
 4. **Canlı güncelleme (Config):**
    - Kalıcı değişiklik: bar `ReadDirectoryChangesW` ile `%APPDATA%\Taskbar` dizinini izler (olay tabanlı).
-   - **Canlı önizleme:** ayarlar uygulaması bar'a **named pipe** üzerinden geçici config gönderir; "Kaydet" ile dosyaya yazılır, "İptal" ile eski haline döner. Ayarlar kapanınca/çökünce bar kaydedilmiş config'e döner.
+   - **Canlı önizleme:** ayarlar uygulaması bar'a **`\\.\pipe\TaskbarLiveConfigV1`** named pipe üzerinden geçici config gönderir; "Kaydet" ile dosyaya yazılır, "İptal" ile eski haline döner. Ayarlar kapanınca/çökünce bar kaydedilmiş config'e döner.
 5. **Yerleşim motoru ve Dikey Kenar (`Left`/`Right`) Davranışı:**
    - Başlangıçta doğrusal yerleşim, karmaşık esnek kutu gerektiğinde `taffy` (flexbox).
    - Kenardan bağımsız: üst/alt yatay, sol/sağ dikey akış.
    - **Dikey kenar kuralı (kullanıcı onayladı):** Sol ve sağ kenarlarda bar genişliği `thickness` (varsayılan 40 px) ile sınırlı olduğundan modüller `text_for_edge(edge)` ile **iki satırlı/kompakt formatta** (ör. saat `09\n05`, pil `82%\n⚡`) üretilir ve pill genişliği bar kalınlığına (`thickness - padding`) sığdırılır (taşma nedeniyle modül düşmesi önlenir).
 6. **Modül trait'i:** her widget kenara göre (`Edge`) metnini/boyutunu bildirir, çizilir, olay gelince "güncellendim" sinyali verir. Veri kaynakları olay tabanlıdır (ör. `WM_POWERBROADCAST`, dakika sınırına hizalanmış timer).
 7. **Tema = veri:** renk, yazı tipi, boyutlar kodda gömülü değil.
-8. **Ayarlar uygulaması teknolojisi (kullanıcı onayladı):** Tauri; bar'dan ayrı süreç olduğu için WebView maliyeti kabul edilebilir.
+8. **Ayarlar uygulaması teknolojisi:** Başlangıçta Tauri planlanmış olsa da ortamda Node/WebView2 derleme zinciri bulunmadığından ve projedeki sıfır-bağımlılıklı yerel yığınla uyum için `crates/settings` (`taskbar-settings.exe`) ayrı süreçte `windows-rs` + DWM Mica (`DWMSBT_MAINWINDOW`) + `tiny-skia` + `fontdue` özel vurgu/tıklama alanı (hit-tested) arayüzüyle geliştirilir; `\\.\pipe\TaskbarLiveConfigV1` named pipe üzerinden `bar` ile konuşur.
 9. **GitHub Releases Güncelleme Mimarisi (kullanıcı Yaklaşım A'yı seçti):**
    - **Değerlendirilen yaklaşımlar:**
      - *Yaklaşım A (Seçilen):* Güncelleme kontrolü ve indirme işlemi ayrı süreçte (`taskbar-updater` / `settings`) çalışır; `bar` içinde HTTP/TLS yığını bulunmaz.

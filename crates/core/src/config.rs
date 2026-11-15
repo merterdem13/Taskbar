@@ -1,6 +1,45 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const CONFIG_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WidgetSettings {
+    pub show_icon: bool,
+    pub show_label: bool,
+    pub params: BTreeMap<String, String>,
+}
+
+impl Default for WidgetSettings {
+    fn default() -> Self {
+        Self {
+            show_icon: true,
+            show_label: true,
+            params: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WidgetCatalogEntry {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub description: &'static str,
+}
+
+pub const KNOWN_WIDGETS: &[WidgetCatalogEntry] = &[
+    WidgetCatalogEntry {
+        id: "battery",
+        title: "Pil ve Güç",
+        description: "Sistem pil yüzdesi ve şarj durumu",
+    },
+    WidgetCatalogEntry {
+        id: "clock",
+        title: "Saat",
+        description: "Yerel sistem saati (24s / 12s)",
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -84,6 +123,7 @@ pub struct Config {
     pub bar: BarConfig,
     pub theme: Theme,
     pub modules: Vec<String>,
+    pub module_config: BTreeMap<String, WidgetSettings>,
 }
 
 impl Default for Config {
@@ -93,6 +133,7 @@ impl Default for Config {
             bar: BarConfig::default(),
             theme: Theme::default(),
             modules: vec!["battery".to_string(), "clock".to_string()],
+            module_config: BTreeMap::new(),
         }
     }
 }
@@ -137,6 +178,44 @@ impl Config {
         }
         self.theme.font_size = self.theme.font_size.clamp(8.0, 32.0);
         self
+    }
+
+    pub fn widget_settings(&self, id: &str) -> WidgetSettings {
+        self.module_config.get(id).cloned().unwrap_or_default()
+    }
+
+    pub fn widget_settings_mut(&mut self, id: &str) -> &mut WidgetSettings {
+        self.module_config.entry(id.to_string()).or_default()
+    }
+
+    pub fn is_module_enabled(&self, id: &str) -> bool {
+        self.modules.iter().any(|m| m == id)
+    }
+
+    pub fn set_module_enabled(&mut self, id: &str, enabled: bool) {
+        if enabled {
+            if !self.is_module_enabled(id) {
+                self.modules.push(id.to_string());
+            }
+        } else {
+            self.modules.retain(|m| m != id);
+        }
+    }
+
+    pub fn move_module(&mut self, id: &str, delta: isize) -> bool {
+        let Some(idx) = self.modules.iter().position(|m| m == id) else {
+            return false;
+        };
+        let target = idx as isize + delta;
+        if target < 0 || target >= self.modules.len() as isize {
+            return false;
+        }
+        let target = target as usize;
+        if target == idx {
+            return false;
+        }
+        self.modules.swap(idx, target);
+        true
     }
 }
 
@@ -249,5 +328,62 @@ font_size = 16.0
         nan_cfg.theme.font_size = f32::NAN;
         let nan_clamped = nan_cfg.clamped();
         assert_eq!(nan_clamped.theme.font_size, 14.0);
+    }
+
+    #[test]
+    fn module_config_slots_roundtrip_and_preserve_on_migration() {
+        let raw = r#"
+version = 0
+modules = ["clock", "battery"]
+
+[bar]
+edge = "right"
+
+[module_config.clock]
+show_icon = false
+show_label = true
+[module_config.clock.params]
+format = "12h"
+
+[module_config.battery]
+show_icon = false
+[module_config.battery.params]
+show_bolt = "false"
+"#;
+        let mut cfg = Config::parse(raw).expect("parses v0 with module_config");
+        assert_eq!(cfg.version, CONFIG_VERSION);
+        assert_eq!(cfg.bar.edge, Edge::Right);
+
+        let clock = cfg.widget_settings("clock");
+        assert!(!clock.show_icon);
+        assert!(clock.show_label);
+        assert_eq!(clock.params.get("format").map(String::as_str), Some("12h"));
+
+        let battery = cfg.widget_settings("battery");
+        assert!(!battery.show_icon);
+        assert!(battery.show_label);
+        assert_eq!(
+            battery.params.get("show_bolt").map(String::as_str),
+            Some("false")
+        );
+
+        assert!(cfg.is_module_enabled("clock"));
+        assert!(cfg.move_module("battery", -1));
+        assert_eq!(cfg.modules, vec!["battery".to_string(), "clock".to_string()]);
+        assert!(!cfg.move_module("battery", -1));
+
+        cfg.set_module_enabled("battery", false);
+        assert!(!cfg.is_module_enabled("battery"));
+        assert_eq!(cfg.modules, vec!["clock".to_string()]);
+
+        cfg.set_module_enabled("battery", true);
+        cfg.set_module_enabled("battery", true);
+        assert_eq!(cfg.modules, vec!["clock".to_string(), "battery".to_string()]);
+
+        let serialized = toml::to_string(&cfg).expect("serializes");
+        let reparsed = Config::parse(&serialized).expect("reparses");
+        assert_eq!(cfg, reparsed);
+        assert!(KNOWN_WIDGETS.iter().any(|w| w.id == "clock"));
+        assert!(KNOWN_WIDGETS.iter().any(|w| w.id == "battery"));
     }
 }

@@ -1,15 +1,24 @@
-use crate::config::Edge;
+use crate::config::{Edge, WidgetSettings};
 use crate::module::{Clock, Module};
 
 pub struct ClockModule {
     clock: Box<dyn Clock>,
     current: (u8, u8),
+    settings: WidgetSettings,
 }
 
 impl ClockModule {
     pub fn new(clock: Box<dyn Clock>) -> Self {
+        Self::with_settings(clock, WidgetSettings::default())
+    }
+
+    pub fn with_settings(clock: Box<dyn Clock>, settings: WidgetSettings) -> Self {
         let current = clock.now();
-        Self { clock, current }
+        Self {
+            clock,
+            current,
+            settings,
+        }
     }
 }
 
@@ -19,11 +28,29 @@ impl Module for ClockModule {
     }
 
     fn text(&self, edge: Edge) -> String {
+        let use_12h = self
+            .settings
+            .params
+            .get("format")
+            .map(|s| s.as_str())
+            == Some("12h");
         let (h, m) = self.current;
-        if edge.is_vertical() {
-            format!("{h:02}\n{m:02}")
+        let display_h = if use_12h {
+            match h % 12 {
+                0 => 12,
+                v => v,
+            }
         } else {
-            format!("{h:02}:{m:02}")
+            h
+        };
+
+        if edge.is_vertical() {
+            format!("{display_h:02}\n{m:02}")
+        } else if use_12h && self.settings.show_label {
+            let suffix = if h < 12 { "AM" } else { "PM" };
+            format!("{display_h:02}:{m:02} {suffix}")
+        } else {
+            format!("{display_h:02}:{m:02}")
         }
     }
 
@@ -76,5 +103,32 @@ mod tests {
         assert!(m.refresh());
         assert_eq!(m.text(Edge::Top), "09:06");
         assert!(!m.refresh());
+    }
+
+    #[test]
+    fn clock_respects_12h_format_widget_setting() {
+        let mut settings = crate::config::WidgetSettings::default();
+        settings
+            .params
+            .insert("format".to_string(), "12h".to_string());
+
+        let time = Rc::new(Cell::new((0, 5)));
+        let mut m = ClockModule::with_settings(
+            Box::new(FakeClock {
+                time: Rc::clone(&time),
+            }),
+            settings.clone(),
+        );
+        assert_eq!(m.text(Edge::Top), "12:05 AM");
+        assert_eq!(m.text(Edge::Right), "12\n05");
+
+        time.set((14, 30));
+        assert!(m.refresh());
+        assert_eq!(m.text(Edge::Top), "02:30 PM");
+        assert_eq!(m.text(Edge::Left), "02\n30");
+
+        settings.show_label = false;
+        let m_no_label = ClockModule::with_settings(Box::new(FakeClock { time }), settings);
+        assert_eq!(m_no_label.text(Edge::Top), "02:30");
     }
 }
