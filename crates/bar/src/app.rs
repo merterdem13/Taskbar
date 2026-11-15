@@ -25,14 +25,14 @@ use crate::appbar::{place_appbar, register_appbar, remove_appbar, WINDOW_CLASS, 
 use crate::config_watch::{
     default_config_path, reload_keeping_previous, watch, WM_CONFIG_CHANGED,
 };
-use crate::render::{apply_backdrop, paint_bar, D2dCanvas};
+use crate::render::{apply_backdrop, paint_bar, ActiveCanvas};
 use crate::sys::{ms_until_next_minute, SystemClock, SystemPower};
 
 const MENU_CHECK_UPDATES: usize = 1;
 const MENU_EXIT: usize = 2;
 
 thread_local! {
-    static CANVAS: RefCell<Option<D2dCanvas>> = const { RefCell::new(None) };
+    static CANVAS: RefCell<Option<ActiveCanvas>> = const { RefCell::new(None) };
     static CFG: RefCell<Config> = RefCell::new(Config::default());
     static CFG_PATH: RefCell<PathBuf> = RefCell::new(PathBuf::new());
     static MODULES: RefCell<Vec<Box<dyn Module>>> = const { RefCell::new(Vec::new()) };
@@ -272,7 +272,7 @@ pub fn run_with_path(cfg: Config, config_path: PathBuf) -> Result<()> {
         let _watch_handle = watch(&config_path, hwnd).ok();
         register_appbar(hwnd);
         guarded_place_appbar(hwnd);
-        let canvas = D2dCanvas::new(hwnd)?;
+        let canvas = ActiveCanvas::new(hwnd)?;
         CANVAS.with(|c| *c.borrow_mut() = Some(canvas));
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         let _ = InvalidateRect(Some(hwnd), None, false);

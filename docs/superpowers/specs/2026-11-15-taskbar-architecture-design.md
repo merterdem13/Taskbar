@@ -26,8 +26,8 @@ Windows için, mevcut battery widget'ı ile uyumlu/gömülü, görsel olarak çe
 ## Yaklaşımlar (değerlendirilen)
 | Yaklaşım | Bellek | Not | Karar |
 |---|---|---|---|
-| A. `windows-rs` + Direct2D/DirectComposition/DirectWrite | Prototipte 60 MB | Tam kontrol; D2D yığını RAM yiyor | Başlangıç, ölçüme göre değişebilir |
-| A'. `windows-rs` + `tiny-skia` CPU çizim + `UpdateLayeredWindow` | Beklenen en düşük | Acrylic'i DWM'e bağlamak ek iş | Denenecek |
+| A. `windows-rs` + Direct2D/DirectComposition/DirectWrite | 62.88 MB WS / 47.59 MB Private | Tam kontrol; D2D/DirectWrite yığını RAM yiyor | Yedek (`render-d2d` feature) |
+| A'. `windows-rs` + `tiny-skia` CPU çizim + `fontdue` + DWM BGRA sunum | **10.81 MB WS / 3.55 MB Private** | DWM Acrylic/Mica + anti-aliased pill + net metin/sembol, 0 ms boşta CPU | **Seçildi (`render-skia` varsayılan)** |
 | B. Slint | ~15–25 MB (tahmin) | Hızlı geliştirme | Yedek |
 | E. Tauri/WebView2 (bar için) | 50–100+ MB | Hedefe ters | **Elendi** (bar için) |
 
@@ -82,5 +82,5 @@ Render yığını bir **render soyutlaması** arkasında tutulur. **Kullanıcı 
 - Çoklu monitör davranışı.
 
 ## Açık işler
-- Prototip bellek ölçümü: 60 MB hedefin çok üstünde; D2D/DirectWrite yükünün profili ve A' ile karşılaştırma yapılacak.
+- **Tamamlandı (Render Kararı):** Direct2D (`render-d2d`: 62.88 MB Working Set / 47.59 MB Private Bytes) ile `tiny-skia` + `fontdue` (`render-skia`: **10.81 MB Working Set / 3.55 MB Private Bytes**, 0 ms boşta CPU) ölçüldü (`docs/superpowers/specs/render-measurements.md`). Görsel tabanı koruyarak 10–20 MB bellek hedefini yakalayan `render-skia` varsayılan backend olarak seçildi.
 - Prototip görsel olarak kullanıcı tarafından henüz doğrulanmadı.

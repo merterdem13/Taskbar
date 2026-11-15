@@ -1,5 +1,17 @@
+#[cfg(feature = "render-d2d")]
 pub mod d2d;
+#[cfg(feature = "render-d2d")]
 pub use d2d::D2dCanvas;
+
+#[cfg(feature = "render-skia")]
+pub mod skia;
+#[cfg(feature = "render-skia")]
+pub use skia::SkiaCanvas;
+
+#[cfg(feature = "render-skia")]
+pub type ActiveCanvas = SkiaCanvas;
+#[cfg(all(not(feature = "render-skia"), feature = "render-d2d"))]
+pub type ActiveCanvas = D2dCanvas;
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{
@@ -104,19 +116,62 @@ pub fn paint_bar(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use core::{build_modules, Clock, Edge, PowerSource, PowerState, Rect};
-    use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WNDCLASSW,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
 
-    struct FixedClock;
+    unsafe extern "system" fn dummy_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wp: windows::Win32::Foundation::WPARAM,
+        lp: windows::Win32::Foundation::LPARAM,
+    ) -> windows::Win32::Foundation::LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
+
+    pub(crate) fn create_test_hwnd(width: i32, height: i32) -> HWND {
+        unsafe {
+            let hi = GetModuleHandleW(PCWSTR::null()).expect("module handle");
+            let class = w!("RustTaskbarRenderTestWindow");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(dummy_wndproc),
+                hInstance: hi.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                class,
+                w!("render_test"),
+                WS_POPUP,
+                0,
+                0,
+                width,
+                height,
+                None,
+                None,
+                Some(hi.into()),
+                None,
+            )
+            .expect("create test window")
+        }
+    }
+
+    pub(crate) struct FixedClock;
     impl Clock for FixedClock {
         fn now(&self) -> (u8, u8) {
             (9, 5)
         }
     }
 
-    struct FixedPower;
+    pub(crate) struct FixedPower;
     impl PowerSource for FixedPower {
         fn read(&self) -> Option<PowerState> {
             Some(PowerState {
@@ -162,7 +217,7 @@ mod tests {
         assert_eq!(backdrop_type_value(Backdrop::Mica), 2);
         assert_eq!(backdrop_type_value(Backdrop::Solid), 1);
 
-        let hwnd = d2d::tests::create_test_hwnd(200, 40);
+        let hwnd = create_test_hwnd(200, 40);
         apply_backdrop(hwnd, Backdrop::Acrylic);
         apply_backdrop(hwnd, Backdrop::Mica);
         apply_backdrop(hwnd, Backdrop::Solid);
@@ -222,9 +277,10 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "render-d2d")]
     #[test]
     fn d2d_paint_bar_all_four_edges_end_to_end() {
-        let hwnd = d2d::tests::create_test_hwnd(1920, 40);
+        let hwnd = create_test_hwnd(1920, 40);
         let mut d2d = D2dCanvas::new(hwnd).expect("create D2dCanvas");
 
         for edge in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
