@@ -1,5 +1,7 @@
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use windows::core::{w, Result, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
@@ -19,28 +21,34 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_POPUP,
 };
 
-use core::{build_modules, Config, Module, Size};
+use core::{
+    build_modules_with_config, Config, Module, PreviewSessionState, Size, DEFAULT_PIPE_NAME,
+};
 
 use crate::appbar::{place_appbar, register_appbar, remove_appbar, WINDOW_CLASS, WM_APPBAR};
 use crate::config_watch::{
     default_config_path, reload_keeping_previous, watch, WM_CONFIG_CHANGED,
 };
+use crate::ipc_server::{start_ipc_server, IpcEvent, SharedIpcQueue, WM_IPC_EVENT};
 use crate::render::{apply_backdrop, paint_bar, ActiveCanvas};
 use crate::sys::{ms_until_next_minute, SystemClock, SystemPower};
 
-const MENU_CHECK_UPDATES: usize = 1;
-const MENU_EXIT: usize = 2;
+const MENU_OPEN_SETTINGS: usize = 1;
+const MENU_CHECK_UPDATES: usize = 2;
+const MENU_EXIT: usize = 3;
 
 thread_local! {
     static CANVAS: RefCell<Option<ActiveCanvas>> = const { RefCell::new(None) };
-    static CFG: RefCell<Config> = RefCell::new(Config::default());
+    static SESSION: RefCell<PreviewSessionState> = RefCell::new(PreviewSessionState::new(Config::default()));
     static CFG_PATH: RefCell<PathBuf> = RefCell::new(PathBuf::new());
     static MODULES: RefCell<Vec<Box<dyn Module>>> = const { RefCell::new(Vec::new()) };
     static IN_PLACE_APPBAR: Cell<bool> = const { Cell::new(false) };
+    static IPC_QUEUE: RefCell<SharedIpcQueue> = RefCell::new(Arc::new(Mutex::new(VecDeque::new())));
+    static SHARED_ACTIVE_CFG: RefCell<Arc<Mutex<Config>>> = RefCell::new(Arc::new(Mutex::new(Config::default())));
 }
 
 fn rebuild_modules(cfg: &Config) {
-    let built = build_modules(&cfg.modules, Box::new(SystemClock), Box::new(SystemPower));
+    let built = build_modules_with_config(cfg, Box::new(SystemClock), Box::new(SystemPower));
     MODULES.with(|m| *m.borrow_mut() = built);
 }
 
@@ -76,7 +84,7 @@ fn paint(hwnd: HWND) {
         CANVAS.with(|c| {
             let mut c = c.borrow_mut();
             let Some(canvas) = c.as_mut() else { return };
-            let cfg = CFG.with(|cfg| cfg.borrow().clone());
+            let cfg = SESSION.with(|s| s.borrow().active_config().clone());
             MODULES.with(|m| {
                 let modules = m.borrow();
                 canvas.begin_draw();
@@ -91,9 +99,43 @@ fn guarded_place_appbar(hwnd: HWND) {
     if IN_PLACE_APPBAR.replace(true) {
         return;
     }
-    let bar_cfg = CFG.with(|c| c.borrow().bar.clone());
+    let bar_cfg = SESSION.with(|s| s.borrow().active_config().bar.clone());
     place_appbar(hwnd, &bar_cfg);
     IN_PLACE_APPBAR.set(false);
+}
+
+fn apply_active_config(hwnd: HWND) {
+    let active = SESSION.with(|s| s.borrow().active_config().clone());
+    SHARED_ACTIVE_CFG.with(|sc| {
+        if let Ok(mut guard) = sc.borrow().lock() {
+            *guard = active.clone();
+        }
+    });
+    rebuild_modules(&active);
+    apply_backdrop(hwnd, active.bar.backdrop);
+    guarded_place_appbar(hwnd);
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
+
+fn write_config_file(path: &std::path::Path, cfg: &Config) {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("failed to create config dir {}: {e}", parent.display());
+                return;
+            }
+        }
+    }
+    match toml::to_string_pretty(cfg) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(path, text) {
+                eprintln!("failed to write config {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("failed to serialize config: {e}"),
+    }
 }
 
 fn build_updater_command(updater: &std::path::Path) -> std::process::Command {
@@ -102,12 +144,16 @@ fn build_updater_command(updater: &std::path::Path) -> std::process::Command {
     cmd
 }
 
-fn spawn_updater() {
+fn build_settings_command(settings: &std::path::Path) -> std::process::Command {
+    std::process::Command::new(settings)
+}
+
+fn spawn_sibling_exe(exe_name: &str, build_cmd: fn(&std::path::Path) -> std::process::Command) {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let updater = dir.join("taskbar-updater.exe");
-            if updater.exists() {
-                let _ = build_updater_command(&updater).spawn();
+            let target = dir.join(exe_name);
+            if target.exists() {
+                let _ = build_cmd(&target).spawn();
             }
         }
     }
@@ -118,6 +164,7 @@ fn show_context_menu(hwnd: HWND) {
         let Ok(menu) = CreatePopupMenu() else {
             return;
         };
+        let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_SETTINGS, w!("Ayarlar"));
         let _ = AppendMenuW(
             menu,
             MF_STRING,
@@ -142,7 +189,8 @@ fn show_context_menu(hwnd: HWND) {
         let _ = DestroyMenu(menu);
 
         match cmd.0 as usize {
-            MENU_CHECK_UPDATES => spawn_updater(),
+            MENU_OPEN_SETTINGS => spawn_sibling_exe("taskbar-settings.exe", build_settings_command),
+            MENU_CHECK_UPDATES => spawn_sibling_exe("taskbar-updater.exe", build_updater_command),
             MENU_EXIT => {
                 let _ = DestroyWindow(hwnd);
             }
@@ -155,7 +203,7 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     unsafe {
         match msg {
             WM_CREATE => {
-                let backdrop = CFG.with(|c| c.borrow().bar.backdrop);
+                let backdrop = SESSION.with(|s| s.borrow().active_config().bar.backdrop);
                 apply_backdrop(hwnd, backdrop);
                 rearm_minute_timer(hwnd);
                 LRESULT(0)
@@ -213,15 +261,62 @@ pub unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             }
             WM_CONFIG_CHANGED => {
                 let path = CFG_PATH.with(|p| p.borrow().clone());
-                let next_cfg = CFG.with(|c| {
-                    let prev = c.borrow();
-                    reload_keeping_previous(&path, &prev)
+                let changed = SESSION.with(|s| {
+                    let mut session = s.borrow_mut();
+                    let prev_saved = session.saved_config().clone();
+                    let prev_active = session.active_config().clone();
+                    let next_disk = reload_keeping_previous(&path, &prev_saved);
+                    session.on_disk_reload(next_disk);
+                    *session.active_config() != prev_active
                 });
-                rebuild_modules(&next_cfg);
-                apply_backdrop(hwnd, next_cfg.bar.backdrop);
-                CFG.with(|c| *c.borrow_mut() = next_cfg);
-                guarded_place_appbar(hwnd);
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                if changed {
+                    apply_active_config(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_IPC_EVENT => {
+                let events: Vec<IpcEvent> = IPC_QUEUE.with(|q| {
+                    let queue = q.borrow();
+                    let mut guard = queue.lock().expect("ipc queue lock");
+                    guard.drain(..).collect()
+                });
+                let mut needs_apply = false;
+                for ev in events {
+                    match ev {
+                        IpcEvent::PreviewConfig(cfg) => {
+                            SESSION.with(|s| {
+                                s.borrow_mut().apply_preview(cfg);
+                            });
+                            needs_apply = true;
+                        }
+                        IpcEvent::RevertPreview => {
+                            if SESSION.with(|s| s.borrow_mut().revert_preview()) {
+                                needs_apply = true;
+                            }
+                        }
+                        IpcEvent::ClientDisconnected => {
+                            if SESSION.with(|s| s.borrow_mut().on_client_disconnect()) {
+                                needs_apply = true;
+                            }
+                        }
+                        IpcEvent::SaveConfig(cfg) => {
+                            let clamped = cfg.clamped();
+                            let path = CFG_PATH.with(|p| p.borrow().clone());
+                            write_config_file(&path, &clamped);
+                            SESSION.with(|s| {
+                                s.borrow_mut().commit_saved(clamped);
+                            });
+                            needs_apply = true;
+                        }
+                        IpcEvent::ShutdownForUpdate => {
+                            let _ = DestroyWindow(hwnd);
+                            return LRESULT(0);
+                        }
+                    }
+                }
+                if needs_apply {
+                    apply_active_config(hwnd);
+                }
                 LRESULT(0)
             }
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
@@ -247,8 +342,12 @@ pub fn run(cfg: Config) -> Result<()> {
 pub fn run_with_path(cfg: Config, config_path: PathBuf) -> Result<()> {
     let cfg = cfg.clamped();
     rebuild_modules(&cfg);
-    CFG.with(|c| *c.borrow_mut() = cfg);
+    SESSION.with(|s| *s.borrow_mut() = PreviewSessionState::new(cfg.clone()));
     CFG_PATH.with(|p| *p.borrow_mut() = config_path.clone());
+    let queue = Arc::new(Mutex::new(VecDeque::new()));
+    IPC_QUEUE.with(|q| *q.borrow_mut() = Arc::clone(&queue));
+    let shared_cfg = Arc::new(Mutex::new(cfg));
+    SHARED_ACTIVE_CFG.with(|sc| *sc.borrow_mut() = Arc::clone(&shared_cfg));
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -276,6 +375,7 @@ pub fn run_with_path(cfg: Config, config_path: PathBuf) -> Result<()> {
             None,
         )?;
         let _watch_handle = watch(&config_path, hwnd).ok();
+        let _ipc_handle = start_ipc_server(DEFAULT_PIPE_NAME, hwnd, queue, shared_cfg).ok();
         register_appbar(hwnd);
         guarded_place_appbar(hwnd);
         let canvas = ActiveCanvas::new(hwnd)?;
@@ -304,5 +404,13 @@ mod tests {
         assert_eq!(cmd.get_program(), updater_path.as_os_str());
         let args: Vec<&OsStr> = cmd.get_args().collect();
         assert_eq!(args, vec![OsStr::new("--apply")]);
+    }
+
+    #[test]
+    fn settings_command_targets_taskbar_settings_exe() {
+        let settings_path = Path::new(r"C:\Taskbar\taskbar-settings.exe");
+        let cmd = build_settings_command(settings_path);
+        assert_eq!(cmd.get_program(), settings_path.as_os_str());
+        assert_eq!(cmd.get_args().count(), 0);
     }
 }

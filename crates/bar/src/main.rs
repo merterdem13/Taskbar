@@ -3,6 +3,7 @@
 pub mod app;
 pub mod appbar;
 pub mod config_watch;
+pub mod ipc_server;
 pub mod render;
 pub mod sys;
 
