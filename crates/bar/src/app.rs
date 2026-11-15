@@ -96,12 +96,18 @@ fn guarded_place_appbar(hwnd: HWND) {
     IN_PLACE_APPBAR.set(false);
 }
 
+fn build_updater_command(updater: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(updater);
+    cmd.arg("--apply");
+    cmd
+}
+
 fn spawn_updater() {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let updater = dir.join("taskbar-updater.exe");
             if updater.exists() {
-                let _ = std::process::Command::new(updater).spawn();
+                let _ = build_updater_command(&updater).spawn();
             }
         }
     }
@@ -282,5 +288,21 @@ pub fn run_with_path(cfg: Config, config_path: PathBuf) -> Result<()> {
             DispatchMessageW(&msg);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[test]
+    fn updater_command_passes_apply_flag() {
+        let updater_path = Path::new(r"C:\Taskbar\taskbar-updater.exe");
+        let cmd = build_updater_command(updater_path);
+        assert_eq!(cmd.get_program(), updater_path.as_os_str());
+        let args: Vec<&OsStr> = cmd.get_args().collect();
+        assert_eq!(args, vec![OsStr::new("--apply")]);
     }
 }

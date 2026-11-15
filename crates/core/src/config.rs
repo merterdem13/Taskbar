@@ -132,6 +132,9 @@ impl Config {
         self.bar.thickness = self.bar.thickness.clamp(24, 120);
         self.bar.gap = self.bar.gap.min(64);
         self.bar.corner_radius = self.bar.corner_radius.min(40);
+        if !self.theme.font_size.is_finite() {
+            self.theme.font_size = Theme::default().font_size;
+        }
         self.theme.font_size = self.theme.font_size.clamp(8.0, 32.0);
         self
     }
@@ -241,5 +244,10 @@ font_size = 16.0
         let high_clamped = high.clamped();
         assert_eq!(high_clamped.bar.thickness, 120);
         assert_eq!(high_clamped.theme.font_size, 32.0);
+
+        let mut nan_cfg = Config::default();
+        nan_cfg.theme.font_size = f32::NAN;
+        let nan_clamped = nan_cfg.clamped();
+        assert_eq!(nan_clamped.theme.font_size, 14.0);
     }
 }

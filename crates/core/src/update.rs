@@ -105,14 +105,21 @@ pub fn swap_executable_preserving_config(
     fs::metadata(staged_exe).map_err(|e| UpdateError::Io(e.to_string()))?;
 
     let backup_path = install_exe.with_extension("exe.old");
+    let mut renamed_to_backup = false;
     if install_exe.exists() {
         if backup_path.exists() {
             let _ = fs::remove_file(&backup_path);
         }
         fs::rename(install_exe, &backup_path).map_err(|e| UpdateError::Io(e.to_string()))?;
+        renamed_to_backup = true;
     }
 
-    fs::copy(staged_exe, install_exe).map_err(|e| UpdateError::Io(e.to_string()))?;
+    if let Err(e) = fs::copy(staged_exe, install_exe) {
+        if renamed_to_backup {
+            let _ = fs::rename(&backup_path, install_exe);
+        }
+        return Err(UpdateError::Io(e.to_string()));
+    }
 
     if let Some(expected_bytes) = config_snapshot {
         let actual_bytes = fs::read(user_config).map_err(|e| UpdateError::Io(e.to_string()))?;
@@ -225,6 +232,29 @@ mod tests {
             fs::read_to_string(&user_config).unwrap(),
             custom_config,
             "customized config.toml must be preserved byte-for-byte"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_executable_restores_backup_if_copy_fails() {
+        let dir = temp_test_dir("swap_restores_on_copy_fail");
+        let install_exe = dir.join("taskbar.exe");
+        let staged_dir = dir.join("staged_is_a_directory");
+        let user_config = dir.join("config.toml");
+
+        let v1_bytes = b"MZ-taskbar-binary-v1";
+        fs::write(&install_exe, v1_bytes).unwrap();
+        fs::create_dir_all(&staged_dir).unwrap();
+
+        let err =
+            swap_executable_preserving_config(&install_exe, &staged_dir, &user_config).unwrap_err();
+        assert!(matches!(err, UpdateError::Io(_)));
+        assert_eq!(
+            fs::read(&install_exe).unwrap(),
+            v1_bytes,
+            "original install_exe must be restored when copy fails"
         );
 
         let _ = fs::remove_dir_all(&dir);

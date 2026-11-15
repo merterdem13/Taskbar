@@ -305,7 +305,11 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
 
-            let _ = close_window_by_class_and_wait(TASKBAR_WINDOW_CLASS, Duration::from_secs(5));
+            if !close_window_by_class_and_wait(TASKBAR_WINDOW_CLASS, Duration::from_secs(5)) {
+                eprintln!(
+                    "warning: timed out waiting for running taskbar window to close after 5s"
+                );
+            }
 
             let exe_dir = std::env::current_exe()
                 .ok()
