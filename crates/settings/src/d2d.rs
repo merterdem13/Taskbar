@@ -56,10 +56,6 @@ pub fn apply_integrated_frame(hwnd: HWND) {
     }
 }
 
-pub fn apply_dark_titlebar(hwnd: HWND) {
-    apply_integrated_frame(hwnd);
-}
-
 pub struct D2dCanvas {
     _factory: ID2D1Factory,
     dwrite: IDWriteFactory,
