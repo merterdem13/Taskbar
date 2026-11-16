@@ -17,6 +17,7 @@ pub enum UiAction {
     SetAlign(Align),
     SetBackdrop(Backdrop),
     AdjustThickness(i32),
+    SetThickness(u32),
     SetThicknessRatio(f32),
     AdjustGap(i32),
     AdjustCornerRadius(i32),
@@ -32,6 +33,9 @@ pub enum UiAction {
     CheckUpdates,
     Revert,
     Save,
+    WindowMinimize,
+    WindowMaximize,
+    WindowClose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +101,7 @@ pub struct SettingsAppState {
     pub status_text: String,
     pub live_connected: bool,
     pub config_path: PathBuf,
+    pub window_maximized: bool,
 }
 
 impl SettingsAppState {
@@ -116,6 +121,7 @@ impl SettingsAppState {
             status_text: String::new(),
             live_connected,
             config_path,
+            window_maximized: false,
         }
     }
 
@@ -164,6 +170,12 @@ impl SettingsAppState {
             UiAction::AdjustThickness(delta) => {
                 let next = (self.working_config.bar.thickness as i32 + delta).max(0) as u32;
                 self.working_config.bar.thickness = next;
+                self.working_config = self.working_config.clone().clamped();
+                self.status_text.clear();
+                ActionEffect::PreviewChanged
+            }
+            UiAction::SetThickness(thickness) => {
+                self.working_config.bar.thickness = thickness.clamp(24, 120);
                 self.working_config = self.working_config.clone().clamped();
                 self.status_text.clear();
                 ActionEffect::PreviewChanged
@@ -263,6 +275,9 @@ impl SettingsAppState {
                 ActionEffect::RevertRequested
             }
             UiAction::Save => ActionEffect::SaveRequested,
+            UiAction::WindowMinimize | UiAction::WindowMaximize | UiAction::WindowClose => {
+                ActionEffect::None
+            }
         }
     }
 
@@ -487,5 +502,45 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn set_thickness_clamps_between_24_and_120() {
+        let path = temp_cfg_path("thickness_clamp");
+        let mut state = SettingsAppState::new(Config::default(), path, true);
+
+        assert_eq!(
+            state.apply_action(UiAction::SetThickness(10)),
+            ActionEffect::PreviewChanged
+        );
+        assert_eq!(state.working_config.bar.thickness, 24);
+
+        assert_eq!(
+            state.apply_action(UiAction::SetThickness(200)),
+            ActionEffect::PreviewChanged
+        );
+        assert_eq!(state.working_config.bar.thickness, 120);
+
+        assert_eq!(
+            state.apply_action(UiAction::SetThickness(56)),
+            ActionEffect::PreviewChanged
+        );
+        assert_eq!(state.working_config.bar.thickness, 56);
+    }
+
+    #[test]
+    fn window_control_actions_do_not_dirty_config() {
+        let path = temp_cfg_path("window_controls");
+        let mut state = SettingsAppState::new(Config::default(), path, true);
+        assert!(!state.window_maximized);
+
+        for action in [
+            UiAction::WindowMinimize,
+            UiAction::WindowMaximize,
+            UiAction::WindowClose,
+        ] {
+            assert_eq!(state.apply_action(action), ActionEffect::None);
+            assert!(!state.has_unsaved_changes());
+        }
     }
 }
