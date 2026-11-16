@@ -3,7 +3,7 @@ use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
 
 use fontdue::{Font, FontSettings, Metrics};
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Transform};
+use tiny_skia::{Color, FillRule, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
@@ -18,6 +18,20 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use core::{Canvas, Rect, Size};
 
+pub trait SettingsPainter: Canvas {
+    fn stroke_round_rect(&mut self, _r: Rect, _radius: f32, _width: f32, _color: [u8; 4]) {}
+    fn draw_line(
+        &mut self,
+        _x1: f32,
+        _y1: f32,
+        _x2: f32,
+        _y2: f32,
+        _width: f32,
+        _color: [u8; 4],
+    ) {
+    }
+}
+
 #[derive(Clone)]
 struct CachedGlyph {
     metrics: Metrics,
@@ -26,8 +40,11 @@ struct CachedGlyph {
 
 #[derive(Default)]
 struct GlyphCache {
-    line_metrics: HashMap<u32, (f32, f32, i32)>,
-    glyphs: HashMap<(char, u32), CachedGlyph>,
+    primary_regular: Option<Font>,
+    primary_bold: Option<Font>,
+    symbol: Option<Font>,
+    line_metrics: HashMap<(u32, bool), (f32, f32, i32)>,
+    glyphs: HashMap<(char, u32, bool), CachedGlyph>,
 }
 
 static GLYPH_CACHE: OnceLock<Mutex<GlyphCache>> = OnceLock::new();
@@ -46,24 +63,43 @@ fn load_font_from_paths(paths: &[&str]) -> Option<Font> {
 }
 
 impl GlyphCache {
-    fn ensure_populated(&mut self, px: f32, text: &str) {
+    fn ensure_populated(&mut self, px: f32, bold: bool, text: &str) {
         let bits = px.to_bits();
-        let needs_line = !self.line_metrics.contains_key(&bits);
+        let needs_line = !self.line_metrics.contains_key(&(bits, bold));
         let needs_char = text
             .chars()
-            .any(|ch| ch != '\n' && !self.glyphs.contains_key(&(ch, bits)));
+            .any(|ch| ch != '\n' && !self.glyphs.contains_key(&(ch, bits, bold)));
 
         if !needs_line && !needs_char {
             return;
         }
 
-        let primary = load_font_from_paths(&[
-            r"C:\Windows\Fonts\SegUIVar.ttf",
-            r"C:\Windows\Fonts\segoeui.ttf",
-            r"C:\Windows\Fonts\segoeuib.ttf",
-        ])
-        .expect("Windows Segoe UI font must exist");
-        let mut symbol: Option<Font> = None;
+        if self.primary_regular.is_none() {
+            self.primary_regular = Some(
+                load_font_from_paths(&[
+                    r"C:\Windows\Fonts\SegUIVar.ttf",
+                    r"C:\Windows\Fonts\segoeui.ttf",
+                    r"C:\Windows\Fonts\segoeuib.ttf",
+                ])
+                .expect("Windows Segoe UI font must exist"),
+            );
+        }
+        if bold && self.primary_bold.is_none() {
+            self.primary_bold = Some(
+                load_font_from_paths(&[
+                    r"C:\Windows\Fonts\segoeuib.ttf",
+                    r"C:\Windows\Fonts\SegUIVar.ttf",
+                    r"C:\Windows\Fonts\segoeui.ttf",
+                ])
+                .expect("Windows Segoe UI Bold font must exist"),
+            );
+        }
+
+        let primary = if bold {
+            self.primary_bold.as_ref().expect("bold font cached")
+        } else {
+            self.primary_regular.as_ref().expect("regular font cached")
+        };
 
         if needs_line {
             let metrics = if let Some(lm) = primary.horizontal_line_metrics(px) {
@@ -72,20 +108,23 @@ impl GlyphCache {
             } else {
                 (px * 0.8, -px * 0.2, (px * 1.25).ceil().max(1.0) as i32)
             };
-            self.line_metrics.insert(bits, metrics);
+            self.line_metrics.insert((bits, bold), metrics);
         }
 
         for ch in WARMUP_CHARS.chars().chain(text.chars()) {
-            if ch == '\n' || self.glyphs.contains_key(&(ch, bits)) {
+            if ch == '\n' || self.glyphs.contains_key(&(ch, bits, bold)) {
                 continue;
             }
             let (metrics, bitmap) = if primary.lookup_glyph_index(ch) != 0 {
                 primary.rasterize(ch, px)
             } else {
-                let sym = symbol.get_or_insert_with(|| {
-                    load_font_from_paths(&[r"C:\Windows\Fonts\seguisym.ttf"])
-                        .expect("Windows Segoe UI Symbol font must exist")
-                });
+                if self.symbol.is_none() {
+                    self.symbol = Some(
+                        load_font_from_paths(&[r"C:\Windows\Fonts\seguisym.ttf"])
+                            .expect("Windows Segoe UI Symbol font must exist"),
+                    );
+                }
+                let sym = self.symbol.as_ref().expect("symbol font cached");
                 if sym.lookup_glyph_index(ch) != 0 {
                     sym.rasterize(ch, px)
                 } else {
@@ -93,21 +132,21 @@ impl GlyphCache {
                 }
             };
             self.glyphs
-                .insert((ch, bits), CachedGlyph { metrics, bitmap });
+                .insert((ch, bits, bold), CachedGlyph { metrics, bitmap });
         }
     }
 
-    fn line_metrics(&self, px: f32) -> (f32, f32, i32) {
+    fn line_metrics(&self, px: f32, bold: bool) -> (f32, f32, i32) {
         self.line_metrics
-            .get(&px.to_bits())
+            .get(&(px.to_bits(), bold))
             .copied()
             .unwrap_or((px * 0.8, -px * 0.2, (px * 1.25).ceil().max(1.0) as i32))
     }
 
-    fn measure_line_width(&self, line: &str, px: f32) -> f32 {
+    fn measure_line_width(&self, line: &str, px: f32, bold: bool) -> f32 {
         let bits = px.to_bits();
         line.chars()
-            .filter_map(|ch| self.glyphs.get(&(ch, bits)))
+            .filter_map(|ch| self.glyphs.get(&(ch, bits, bold)))
             .map(|g| g.metrics.advance_width)
             .sum()
     }
@@ -244,42 +283,66 @@ impl SkiaCanvas {
     }
 }
 
-impl Canvas for SkiaCanvas {
-    fn fill_round_rect(&mut self, r: Rect, radius: f32, color: [u8; 4]) {
-        if r.w <= 0 || r.h <= 0 {
+fn build_round_rect_path(r: Rect, radius: f32) -> Option<Path> {
+    if r.w <= 0 || r.h <= 0 {
+        return None;
+    }
+    let x0 = r.x as f32;
+    let y0 = r.y as f32;
+    let x1 = (r.x + r.w) as f32;
+    let y1 = (r.y + r.h) as f32;
+    let rad = radius
+        .max(0.0)
+        .min(r.w as f32 * 0.5)
+        .min(r.h as f32 * 0.5);
+
+    if rad <= 0.0 {
+        let rect = tiny_skia::Rect::from_xywh(x0, y0, r.w as f32, r.h as f32)?;
+        Some(PathBuilder::from_rect(rect))
+    } else {
+        let c = rad * 0.552_284_8;
+        let mut pb = PathBuilder::new();
+        pb.move_to(x0 + rad, y0);
+        pb.line_to(x1 - rad, y0);
+        pb.cubic_to(x1 - rad + c, y0, x1, y0 + rad - c, x1, y0 + rad);
+        pb.line_to(x1, y1 - rad);
+        pb.cubic_to(x1, y1 - rad + c, x1 - rad + c, y1, x1 - rad, y1);
+        pb.line_to(x0 + rad, y1);
+        pb.cubic_to(x0 + rad - c, y1, x0, y1 - rad + c, x0, y1 - rad);
+        pb.line_to(x0, y0 + rad);
+        pb.cubic_to(x0, y0 + rad - c, x0 + rad - c, y0, x0 + rad, y0);
+        pb.close();
+        pb.finish()
+    }
+}
+
+impl SettingsPainter for SkiaCanvas {
+    fn stroke_round_rect(&mut self, r: Rect, radius: f32, width: f32, color: [u8; 4]) {
+        if color[3] == 0 || width <= 0.0 {
             return;
         }
-        let x0 = r.x as f32;
-        let y0 = r.y as f32;
-        let x1 = (r.x + r.w) as f32;
-        let y1 = (r.y + r.h) as f32;
-        let rad = radius
-            .max(0.0)
-            .min(r.w as f32 * 0.5)
-            .min(r.h as f32 * 0.5);
+        let Some(path) = build_round_rect_path(r, radius) else {
+            return;
+        };
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(color[0], color[1], color[2], color[3]);
+        paint.anti_alias = true;
+        let stroke = Stroke {
+            width,
+            ..Default::default()
+        };
+        self.pixmap
+            .stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+    }
+}
 
-        let path = if rad <= 0.0 {
-            let Some(rect) = tiny_skia::Rect::from_xywh(x0, y0, r.w as f32, r.h as f32) else {
-                return;
-            };
-            PathBuilder::from_rect(rect)
-        } else {
-            let c = rad * 0.552_284_8;
-            let mut pb = PathBuilder::new();
-            pb.move_to(x0 + rad, y0);
-            pb.line_to(x1 - rad, y0);
-            pb.cubic_to(x1 - rad + c, y0, x1, y0 + rad - c, x1, y0 + rad);
-            pb.line_to(x1, y1 - rad);
-            pb.cubic_to(x1, y1 - rad + c, x1 - rad + c, y1, x1 - rad, y1);
-            pb.line_to(x0 + rad, y1);
-            pb.cubic_to(x0 + rad - c, y1, x0, y1 - rad + c, x0, y1 - rad);
-            pb.line_to(x0, y0 + rad);
-            pb.cubic_to(x0, y0 + rad - c, x0 + rad - c, y0, x0 + rad, y0);
-            pb.close();
-            let Some(path) = pb.finish() else {
-                return;
-            };
-            path
+impl Canvas for SkiaCanvas {
+    fn fill_round_rect(&mut self, r: Rect, radius: f32, color: [u8; 4]) {
+        if color[3] == 0 {
+            return;
+        }
+        let Some(path) = build_round_rect_path(r, radius) else {
+            return;
         };
 
         let mut paint = Paint::default();
@@ -294,15 +357,16 @@ impl Canvas for SkiaCanvas {
         );
     }
 
-    fn draw_text(&mut self, r: Rect, text: &str, color: [u8; 4], _font: &str, size: f32) {
+    fn draw_text(&mut self, r: Rect, text: &str, color: [u8; 4], font: &str, size: f32) {
         if r.w <= 0 || r.h <= 0 || text.is_empty() || color[3] == 0 {
             return;
         }
         let px = size.max(1.0);
+        let bold = font.contains("Bold");
         let bits = px.to_bits();
         let mut guard = cache().lock().expect("glyph cache lock");
-        guard.ensure_populated(px, text);
-        let (ascent, descent, line_h) = guard.line_metrics(px);
+        guard.ensure_populated(px, bold, text);
+        let (ascent, descent, line_h) = guard.line_metrics(px, bold);
         let lines: Vec<&str> = text.split('\n').collect();
         let total_h = lines.len() as f32 * line_h as f32;
         let block_top = r.y as f32 + (r.h as f32 - total_h) * 0.5;
@@ -321,13 +385,13 @@ impl Canvas for SkiaCanvas {
         let stride = pix_w as usize;
 
         for (line_idx, line) in lines.iter().enumerate() {
-            let line_w = guard.measure_line_width(line, px);
+            let line_w = guard.measure_line_width(line, px, bold);
             let mut pen_x = r.x as f32 + (r.w as f32 - line_w) * 0.5;
             let line_top = block_top + line_idx as f32 * line_h as f32;
             let baseline_y = line_top + (line_h as f32 + ascent + descent) * 0.5;
 
             for ch in line.chars() {
-                let Some(g) = guard.glyphs.get(&(ch, bits)) else {
+                let Some(g) = guard.glyphs.get(&(ch, bits, bold)) else {
                     continue;
                 };
                 let metrics = &g.metrics;
@@ -372,19 +436,20 @@ impl Canvas for SkiaCanvas {
         }
     }
 
-    fn measure_text(&mut self, text: &str, _font: &str, size: f32) -> Size {
+    fn measure_text(&mut self, text: &str, font: &str, size: f32) -> Size {
         if text.is_empty() {
             return Size { w: 0, h: 0 };
         }
         let px = size.max(1.0);
+        let bold = font.contains("Bold");
         let mut guard = cache().lock().expect("glyph cache lock");
-        guard.ensure_populated(px, text);
-        let (_, _, line_h) = guard.line_metrics(px);
+        guard.ensure_populated(px, bold, text);
+        let (_, _, line_h) = guard.line_metrics(px, bold);
         let mut max_w = 0i32;
         let mut line_count = 0i32;
         for line in text.split('\n') {
             line_count += 1;
-            let w = guard.measure_line_width(line, px).ceil() as i32;
+            let w = guard.measure_line_width(line, px, bold).ceil() as i32;
             if w > max_w {
                 max_w = w;
             }
@@ -473,6 +538,73 @@ mod tests {
             assert!(nonzero_alpha > 1000, "expected drawn UI pixels on {tab:?}");
             canvas.end_draw().expect("end_draw succeeds");
         }
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn skia_strokes_round_rect_and_renders_bold_font() {
+        let hwnd = unsafe {
+            let hi = GetModuleHandleW(PCWSTR::null()).expect("module handle");
+            let class = w!("RustTaskbarSettingsStrokeTestWindow");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(dummy_wndproc),
+                hInstance: hi.into(),
+                lpszClassName: class,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+            CreateWindowExW(
+                Default::default(),
+                class,
+                w!("stroke_test"),
+                WS_POPUP,
+                0,
+                0,
+                240,
+                120,
+                None,
+                None,
+                Some(hi.into()),
+                None,
+            )
+            .expect("create test window")
+        };
+
+        let mut canvas = SkiaCanvas::new(hwnd).expect("create SkiaCanvas");
+        canvas.resize(240, 120);
+        canvas.begin_draw();
+        canvas.stroke_round_rect(
+            Rect {
+                x: 10,
+                y: 10,
+                w: 220,
+                h: 100,
+            },
+            10.0,
+            1.0,
+            [255, 255, 255, 40],
+        );
+        canvas.draw_text(
+            Rect {
+                x: 20,
+                y: 20,
+                w: 200,
+                h: 80,
+            },
+            "taskbar",
+            [255, 255, 255, 255],
+            "Segoe UI Bold",
+            40.0,
+        );
+        let nonzero_alpha = canvas
+            .pixels()
+            .chunks_exact(4)
+            .filter(|px| px[3] > 0)
+            .count();
+        assert!(nonzero_alpha > 200);
 
         unsafe {
             let _ = DestroyWindow(hwnd);
