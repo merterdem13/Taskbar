@@ -360,7 +360,13 @@ mod tests {
         canvas.begin_draw();
         let splash_regions =
             render_settings_ui_animated(&mut canvas, Size { w: 780, h: 600 }, &state, &splash_anim);
-        assert!(splash_regions.is_empty());
+        assert_eq!(splash_regions.len(), 3);
+        assert!(splash_regions.iter().all(|hr| matches!(
+            hr.action,
+            crate::state::UiAction::WindowMinimize
+                | crate::state::UiAction::WindowMaximize
+                | crate::state::UiAction::WindowClose
+        )));
         canvas.end_draw().expect("splash end_draw succeeds");
 
         for (idx, tab) in [
